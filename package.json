@@ -1,0 +1,24 @@
+{
+  "name": "alpha-omega",
+  "version": "1.0.0",
+  "main": "index.js",
+  "scripts": {
+    "client:dev": "vite",
+    "server:dev": "tsx src/server/server.ts",
+    "dev": "concurrently \"npm run client:dev\" \"npm run server:dev\""
+  },
+  "author": "",
+  "license": "ISC",
+  "description": "",
+  "dependencies": {
+    "socket.io": "^4.8.1",
+    "socket.io-client": "^4.8.1",
+    "three": "^0.179.1"
+  },
+  "devDependencies": {
+    "@types/three": "^0.179.0",
+    "concurrently": "^9.2.0",
+    "tsx": "^4.20.4",
+    "vite": "^7.1.2"
+  }
+}
