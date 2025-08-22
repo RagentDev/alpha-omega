@@ -24,14 +24,18 @@ export class ResponsiveThreeScene {
     private triangleMap = new Map<number, LandTile>();
     private colorDataTexture: THREE.DataTexture;
     private sphereMaterial: THREE.ShaderMaterial;
+    private sphereMesh: THREE.Mesh; // Store reference to the sphere mesh
+    private raycaster: THREE.Raycaster;
+    private mouse: THREE.Vector2;
 
     // Subdivision control
-    private SUBDIVIDES = 4; // Change this from 1-10 for different subdivision levels
+    private SUBDIVIDES = 8; // Change this from 1-10 for different subdivision levels
 
     constructor(canvas: HTMLCanvasElement) {
         this.canvas = canvas;
         this.setupScene();
         this.setupEventListeners();
+        this.setupClickHandler();
         this.animate();
     }
 
@@ -60,11 +64,13 @@ export class ResponsiveThreeScene {
         this.controls.dampingFactor = 0.05;
 
         // Create geometry with LOWER detail
-        const geometry = new THREE.IcosahedronGeometry(4, 32);
-        console.log(`Vertex count: ${geometry.attributes.position.count}`);
+        let geometry = new THREE.IcosahedronGeometry(4, 4);
+        console.log(`Initial vertex count: ${geometry.attributes.position.count}`);
 
         // Add barycentric coordinates and triangle IDs as custom attributes
-        this.addBarycentricCoordinates(geometry);
+        // This will unindex the geometry and return it
+        geometry = this.addBarycentricCoordinates(geometry);
+        console.log(`Vertex count after unindexing: ${geometry.attributes.position.count}`);
 
         // Get face count
         const faceCount = geometry.index ?
@@ -72,9 +78,12 @@ export class ResponsiveThreeScene {
             geometry.attributes.position.count / 3;
 
         // Calculate total number of sub-triangles
-        const subTrianglesPerFace = (this.SUBDIVIDES * (this.SUBDIVIDES + 1)) / 2;
+        // For n subdivisions, we get n^2 sub-triangles per face
+        const subTrianglesPerFace = this.SUBDIVIDES * this.SUBDIVIDES;
         const totalTiles = faceCount * subTrianglesPerFace;
 
+        console.log(`Face count: ${faceCount}`);
+        console.log(`Sub-triangles per face: ${subTrianglesPerFace}`);
         console.log(`Total Tiles: ${totalTiles}`);
 
         // Generate game data for ALL sub-triangles
@@ -152,58 +161,106 @@ export class ResponsiveThreeScene {
                 varying float vTriangleId;
                 varying vec3 vBarycentric;
                 
+                // Hash function for generating random values from tileId
+                vec3 hash3(float n) {
+                    return fract(sin(vec3(n, n + 1.0, n + 2.0)) * vec3(43758.5453, 22578.1459, 19642.3490));
+                }
+                
+                // Generate random color based on tileId
+                vec3 getRandomColor(float tileId) {
+                    vec3 randomValues = hash3(tileId);
+                    
+                    // HSV-based random colors for more pleasing results
+                    float hue = randomValues.x;
+                    float saturation = 0.5 + randomValues.y * 0.4; // 0.5 to 0.9
+                    float value = 0.6 + randomValues.z * 0.3; // 0.6 to 0.9
+                    
+                    // Convert HSV to RGB
+                    vec3 c = vec3(hue, saturation, value);
+                    vec4 K = vec4(1.0, 2.0 / 3.0, 1.0 / 3.0, 3.0);
+                    vec3 p = abs(fract(c.xxx + K.xyz) * 6.0 - K.www);
+                    return c.z * mix(K.xxx, clamp(p - K.xxx, 0.0, 1.0), c.y);
+                }
+                
                 // Function to determine which sub-triangle index we're in
                 float getSubTriangleIndex(vec3 bary) {
                     if (subdivisions <= 1.0) {
                         return 0.0;
                     }
                     
-                    // Clamp barycentric coordinates to prevent edge cases
-                    vec3 clampedBary = clamp(bary, 0.001, 0.999);
+                    float n = subdivisions;
                     
-                    // Scale barycentric coordinates by subdivision level
-                    vec3 scaledBary = clampedBary * subdivisions;
+                    // Convert barycentric to 2D coordinates
+                    // We'll use the standard transformation where:
+                    // x-axis goes from vertex 1 to vertex 2
+                    // y-axis goes perpendicular
+                    float u = bary.y; // Distance along edge from v1 to v2
+                    float v = bary.z; // Distance along edge from v1 to v3
                     
-                    // Get integer parts (which sub-triangle cell we're in)
-                    float u = floor(scaledBary.x);
-                    float v = floor(scaledBary.y);
-                    float w = floor(scaledBary.z);
+                    // Scale to subdivision grid
+                    float gridU = u * n;
+                    float gridV = v * n;
                     
-                    // Ensure we stay within the triangular bounds
-                    u = clamp(u, 0.0, subdivisions - 1.0);
-                    v = clamp(v, 0.0, subdivisions - 1.0);
+                    // Get grid coordinates
+                    float gridX = floor(gridU);
+                    float gridY = floor(gridV);
                     
-                    // For triangular subdivision, ensure u + v < subdivisions
-                    if (u + v >= subdivisions) {
-                        if (u > v) {
-                            u = subdivisions - 1.0 - v;
-                        } else {
-                            v = subdivisions - 1.0 - u;
-                        }
+                    // Local coordinates within grid cell
+                    float localU = fract(gridU);
+                    float localV = fract(gridV);
+                    
+                    // Make sure we're within the triangle bounds
+                    if (gridX + gridY >= n) {
+                        // We're outside the main triangle, clamp to edge
+                        return subTrianglesPerFace - 1.0;
                     }
                     
-                    // Calculate linear index using triangular number formula
-                    // This maps 2D triangle coordinates to 1D array index
-                    float index = u * subdivisions - (u * (u + 1.0)) / 2.0 + v;
+                    // Calculate row and position within row
+                    float row = gridY;
+                    float col = gridX;
+                    
+                    // In each row y, there are 2*(n-y)-1 triangles
+                    // Calculate triangles before this row
+                    float trianglesBeforeRow = row * (2.0 * n - row);
+                    
+                    // In this grid cell, determine if we're in upper or lower triangle
+                    float triangleInCell = (localU + localV > 1.0) ? 1.0 : 0.0;
+                    
+                    // Position in current row
+                    float posInRow = col * 2.0 + triangleInCell;
+                    
+                    // Total index
+                    float index = trianglesBeforeRow + posInRow;
                     
                     return clamp(index, 0.0, subTrianglesPerFace - 1.0);
                 }
                 
-                // Function to draw edge lines
+                // Function to draw edge lines for triangular subdivisions
                 float getEdgeFactor(vec3 bary) {
                     if (subdivisions <= 1.0) {
                         return 1.0;
                     }
                     
-                    // Clamp barycentric coordinates
-                    vec3 clampedBary = clamp(bary, 0.001, 0.999);
-                    vec3 scaledBary = clampedBary * subdivisions;
-                    vec3 fractPart = fract(scaledBary);
+                    float n = subdivisions;
                     
-                    // Calculate distance to nearest edge
-                    float edgeWidth = 0.04 * subdivisions;
-                    float minDist = min(min(fractPart.x, fractPart.y), fractPart.z);
-                    minDist = min(minDist, min(1.0 - fractPart.x, min(1.0 - fractPart.y, 1.0 - fractPart.z)));
+                    // Convert to grid coordinates
+                    float u = bary.y * n;
+                    float v = bary.z * n;
+                    
+                    // Get local position within grid cell
+                    float localU = fract(u);
+                    float localV = fract(v);
+                    
+                    // Distance to nearest edge
+                    float edgeWidth = 0.03;
+                    float minDist = min(localU, localV);
+                    
+                    // Check diagonal edge (for triangular subdivision)
+                    float diagDist = abs(1.0 - localU - localV);
+                    minDist = min(minDist, diagDist);
+                    
+                    // Also check proximity to main triangle edges
+                    minDist = min(minDist, min(bary.x, min(bary.y, bary.z)) * n);
                     
                     return smoothstep(0.0, edgeWidth, minDist);
                 }
@@ -223,17 +280,20 @@ export class ResponsiveThreeScene {
                     float y = floor(tileId / textureSize);
                     vec2 texCoord = (vec2(x, y) + 0.5) / textureSize;
                     
-                    // Sample the specific sub-triangle color
+                    // Sample the specific sub-triangle color (or use random)
                     vec4 tileColor = texture2D(colorTexture, texCoord);
+                    
+                    // Generate random color based on tileId instead of sampling texture
+                    // vec4 tileColor = vec4(getRandomColor(tileId), 1.0);
                     
                     // Apply edge darkening with improved edge detection
                     float edge = getEdgeFactor(vBarycentric);
-                    vec3 edgeColor = tileColor.rgb * 0.8;
+                    vec3 edgeColor = vec3(0.2, 0.2, 0.2); // Dark edges
                     vec3 finalTileColor = mix(edgeColor, tileColor.rgb, edge);
                     
+                    // Add some variation to each tile
                     float random = fract(sin(tileId * 12.9898) * 43758.5453);
-                    float darkeningFactor = 1.0 - (random * 0.2); // Scale from 0.8 to 1.0
-
+                    float darkeningFactor = 0.9 + (random * 0.1);
                     finalTileColor *= darkeningFactor;
                     
                     // Lighting calculation
@@ -250,6 +310,7 @@ export class ResponsiveThreeScene {
         });
 
         const sphere = new THREE.Mesh(geometry, this.sphereMaterial);
+        this.sphereMesh = sphere; // Store reference for raycasting
         this.scene.add(sphere);
 
         // Lighting
@@ -264,7 +325,13 @@ export class ResponsiveThreeScene {
     }
 
     // Add barycentric coordinates and triangle IDs to geometry
-    private addBarycentricCoordinates(geometry: THREE.BufferGeometry) {
+    private addBarycentricCoordinates(geometry: THREE.BufferGeometry): THREE.BufferGeometry {
+        // First, we need to unindex the geometry if it's indexed
+        // This ensures each triangle has its own unique vertices
+        if (geometry.index) {
+            geometry = geometry.toNonIndexed();
+        }
+
         const posCount = geometry.attributes.position.count;
         const barycentrics = new Float32Array(posCount * 3);
         const triangleIds = new Float32Array(posCount); // Add triangle ID attribute
@@ -295,66 +362,73 @@ export class ResponsiveThreeScene {
 
         geometry.setAttribute('barycentric', new THREE.BufferAttribute(barycentrics, 3));
         geometry.setAttribute('triangleId', new THREE.BufferAttribute(triangleIds, 1)); // Add triangle ID attribute
+
+        return geometry; // Return the modified geometry
     }
 
     // Get position of a specific sub-triangle for noise sampling
     private getSubTrianglePosition(geometry: THREE.BufferGeometry, faceIndex: number, subIndex: number): THREE.Vector3 {
         const positions = geometry.attributes.position;
 
-        // Get the three vertices of the main triangle (your existing code)
-        let v1, v2, v3;
-        if (geometry.index) {
-            const i1 = geometry.index.getX(faceIndex * 3);
-            const i2 = geometry.index.getX(faceIndex * 3 + 1);
-            const i3 = geometry.index.getX(faceIndex * 3 + 2);
+        // Get the three vertices of the main triangle
+        const i1 = faceIndex * 3;
+        const i2 = faceIndex * 3 + 1;
+        const i3 = faceIndex * 3 + 2;
 
-            v1 = new THREE.Vector3().fromBufferAttribute(positions, i1);
-            v2 = new THREE.Vector3().fromBufferAttribute(positions, i2);
-            v3 = new THREE.Vector3().fromBufferAttribute(positions, i3);
-        } else {
-            const i1 = faceIndex * 3;
-            const i2 = faceIndex * 3 + 1;
-            const i3 = faceIndex * 3 + 2;
+        const v1 = new THREE.Vector3().fromBufferAttribute(positions, i1);
+        const v2 = new THREE.Vector3().fromBufferAttribute(positions, i2);
+        const v3 = new THREE.Vector3().fromBufferAttribute(positions, i3);
 
-            v1 = new THREE.Vector3().fromBufferAttribute(positions, i1);
-            v2 = new THREE.Vector3().fromBufferAttribute(positions, i2);
-            v3 = new THREE.Vector3().fromBufferAttribute(positions, i3);
+        // For n subdivisions, we have n^2 sub-triangles
+        // Calculate which sub-triangle this is
+        const n = this.SUBDIVIDES;
+        const subTrianglesPerRow = new Array(n);
+
+        // Each row i has 2*(n-i)-1 triangles
+        for (let i = 0; i < n; i++) {
+            subTrianglesPerRow[i] = 2 * (n - i) - 1;
         }
 
-        // **Fixed triangular coordinate calculation**
+        // Find which row this sub-triangle is in
         let row = 0;
-        let remainingIndex = subIndex;
-
-        // Find which row by subtracting row lengths
-        while (remainingIndex >= (this.SUBDIVIDES - row) && row < this.SUBDIVIDES) {
-            remainingIndex -= (this.SUBDIVIDES - row);
-            row++;
+        let trianglesBefore = 0;
+        for (let i = 0; i < n; i++) {
+            if (trianglesBefore + subTrianglesPerRow[i] > subIndex) {
+                row = i;
+                break;
+            }
+            trianglesBefore += subTrianglesPerRow[i];
         }
 
-        const col = remainingIndex;
+        const posInRow = subIndex - trianglesBefore;
+        const col = Math.floor(posInRow / 2);
+        const isUpper = (posInRow % 2) === 1;
 
-        // **Safety check - ensure we don't go outside triangle bounds**
-        if (row >= this.SUBDIVIDES || col >= (this.SUBDIVIDES - row)) {
-            console.warn(`Invalid triangle coordinates: row=${row}, col=${col}, SUBDIVIDES=${this.SUBDIVIDES}`);
-            // Return triangle center as fallback
-            return v1.clone().add(v2).add(v3).divideScalar(3);
+        // Calculate barycentric coordinates for the center of this sub-triangle
+        const step = 1.0 / n;
+        let u, v, w;
+
+        if (isUpper) {
+            u = (row + 0.66) * step;
+            v = (col + 0.66) * step;
+        } else {
+            u = (row + 0.33) * step;
+            v = (col + 0.33) * step;
         }
+        w = 1 - u - v;
 
-        // Convert to barycentric coordinates
-        const u = (row + 0.5) / this.SUBDIVIDES;
-        const v = (col + 0.5) / this.SUBDIVIDES;
-        const w = 1 - u - v;
-
-        // **Additional safety check for barycentric coordinates**
+        // Ensure valid barycentric coordinates
         if (w < 0) {
-            // Fallback to triangle center
-            return v1.clone().add(v2).add(v3).divideScalar(3);
+            const total = u + v;
+            u = u / total;
+            v = v / total;
+            w = 0;
         }
 
         return new THREE.Vector3()
-            .addScaledVector(v1, u)
-            .addScaledVector(v2, v)
-            .addScaledVector(v3, w);
+            .addScaledVector(v1, w)
+            .addScaledVector(v2, u)
+            .addScaledVector(v3, v);
     }
 
     // Method to update subdivision level dynamically
@@ -370,7 +444,7 @@ export class ResponsiveThreeScene {
     // Create data texture from triangle colors
     private createColorDataTexture(tileCount: number) {
         const textureSize = Math.ceil(Math.sqrt(tileCount));
-        console.log(`Texture Size: ${textureSize} | ${textureSize * textureSize}`);
+        console.log(`Texture Size: ${textureSize}x${textureSize} for ${tileCount} tiles`);
         const totalTexels = textureSize * textureSize;
 
         const colorData = new Float32Array(totalTexels * 4);
@@ -386,9 +460,9 @@ export class ResponsiveThreeScene {
                 colorData[baseIndex + 2] = tile.color.b;
                 colorData[baseIndex + 3] = 1.0;
             } else {
-                colorData[baseIndex + 0] = 0.0;
+                colorData[baseIndex + 0] = 1.0;
                 colorData[baseIndex + 1] = 0.0;
-                colorData[baseIndex + 2] = 0.0;
+                colorData[baseIndex + 2] = 1.0; // Magenta for missing tiles
                 colorData[baseIndex + 3] = 1.0;
             }
         }
@@ -456,28 +530,15 @@ export class ResponsiveThreeScene {
 
     private getTriangleCenter(geometry: THREE.BufferGeometry, faceIndex: number): THREE.Vector3 {
         const positions = geometry.attributes.position;
+        const i1 = faceIndex * 3;
+        const i2 = faceIndex * 3 + 1;
+        const i3 = faceIndex * 3 + 2;
 
-        if (geometry.index) {
-            const i1 = geometry.index.getX(faceIndex * 3);
-            const i2 = geometry.index.getX(faceIndex * 3 + 1);
-            const i3 = geometry.index.getX(faceIndex * 3 + 2);
+        const v1 = new THREE.Vector3().fromBufferAttribute(positions, i1);
+        const v2 = new THREE.Vector3().fromBufferAttribute(positions, i2);
+        const v3 = new THREE.Vector3().fromBufferAttribute(positions, i3);
 
-            const v1 = new THREE.Vector3().fromBufferAttribute(positions, i1);
-            const v2 = new THREE.Vector3().fromBufferAttribute(positions, i2);
-            const v3 = new THREE.Vector3().fromBufferAttribute(positions, i3);
-
-            return v1.add(v2).add(v3).divideScalar(3);
-        } else {
-            const i1 = faceIndex * 3;
-            const i2 = faceIndex * 3 + 1;
-            const i3 = faceIndex * 3 + 2;
-
-            const v1 = new THREE.Vector3().fromBufferAttribute(positions, i1);
-            const v2 = new THREE.Vector3().fromBufferAttribute(positions, i2);
-            const v3 = new THREE.Vector3().fromBufferAttribute(positions, i3);
-
-            return v1.add(v2).add(v3).divideScalar(3);
-        }
+        return v1.add(v2).add(v3).divideScalar(3);
     }
 
     private getNoise3D(position: THREE.Vector3, scale: number = 1): number {
@@ -498,10 +559,9 @@ export class ResponsiveThreeScene {
 
     private getRandomLandType(position: THREE.Vector3): LandTile['type'] {
         const elevation = this.getLayeredNoise(position);
-        
+
         if (elevation < 0.45) return 'ocean';
         if (elevation > 0.45 && elevation < 0.5) return 'desert';
-        if (elevation > 0.5 && elevation < 0.7) return 'plains';
         if (elevation > 0.5 && elevation < 0.7) return 'plains';
         if (elevation > 0.7 && elevation < 0.8) return 'forest';
         if (elevation > 0.8) return 'mountain';
@@ -510,6 +570,139 @@ export class ResponsiveThreeScene {
 
     private setupEventListeners() {
         window.addEventListener('resize', () => this.onWindowResize());
+    }
+
+    private setupClickHandler() {
+        this.raycaster = new THREE.Raycaster();
+        this.mouse = new THREE.Vector2();
+
+        this.canvas.addEventListener('click', (event) => {
+            // Calculate mouse position in normalized device coordinates
+            const rect = this.canvas.getBoundingClientRect();
+            this.mouse.x = ((event.clientX - rect.left) / rect.width) * 2 - 1;
+            this.mouse.y = -((event.clientY - rect.top) / rect.height) * 2 + 1;
+
+            // Update raycaster
+            this.raycaster.setFromCamera(this.mouse, this.camera);
+
+            // Check for intersections
+            const intersects = this.raycaster.intersectObject(this.sphereMesh);
+
+            if (intersects.length > 0) {
+                const intersection = intersects[0];
+
+                // Get the face that was clicked
+                const faceIndex = intersection.face ?
+                    Math.floor(intersection.faceIndex / 1) : 0;
+
+                // Get barycentric coordinates of the click point
+                const bary = this.getBarycentricCoordinates(
+                    intersection.point,
+                    intersection.face,
+                    this.sphereMesh.geometry as THREE.BufferGeometry,
+                    intersection.faceIndex
+                );
+
+                // Calculate which sub-triangle was clicked
+                const subIndex = this.calculateSubTriangleIndex(bary);
+
+                // Calculate the tile ID
+                const tileId = faceIndex * (this.SUBDIVIDES * this.SUBDIVIDES) + subIndex;
+
+                // Update the color to red
+                this.updateSubTriangleColor(tileId, new THREE.Color(0xff0000));
+
+                console.log(`Clicked tile ${tileId} (face ${faceIndex}, sub ${subIndex})`);
+            }
+        });
+    }
+
+    // Calculate barycentric coordinates for a point on a triangle
+    private getBarycentricCoordinates(
+        point: THREE.Vector3,
+        face: THREE.Face | null,
+        geometry: THREE.BufferGeometry,
+        faceIndex: number
+    ): THREE.Vector3 {
+        const positions = geometry.attributes.position;
+
+        // Get the three vertices of the triangle
+        const i1 = faceIndex * 3;
+        const i2 = faceIndex * 3 + 1;
+        const i3 = faceIndex * 3 + 2;
+
+        const v1 = new THREE.Vector3().fromBufferAttribute(positions, i1);
+        const v2 = new THREE.Vector3().fromBufferAttribute(positions, i2);
+        const v3 = new THREE.Vector3().fromBufferAttribute(positions, i3);
+
+        // Transform point to local space of the mesh
+        const localPoint = this.sphereMesh.worldToLocal(point.clone());
+
+        // Calculate barycentric coordinates
+        const v0 = v3.clone().sub(v1);
+        const v1v2 = v2.clone().sub(v1);
+        const v2p = localPoint.clone().sub(v1);
+
+        const dot00 = v0.dot(v0);
+        const dot01 = v0.dot(v1v2);
+        const dot02 = v0.dot(v2p);
+        const dot11 = v1v2.dot(v1v2);
+        const dot12 = v1v2.dot(v2p);
+
+        const invDenom = 1 / (dot00 * dot11 - dot01 * dot01);
+        const u = (dot11 * dot02 - dot01 * dot12) * invDenom;
+        const v = (dot00 * dot12 - dot01 * dot02) * invDenom;
+        const w = 1 - u - v;
+
+        return new THREE.Vector3(w, v, u);
+    }
+
+    // Calculate which sub-triangle index based on barycentric coordinates
+    private calculateSubTriangleIndex(bary: THREE.Vector3): number {
+        if (this.SUBDIVIDES <= 1) {
+            return 0;
+        }
+
+        const n = this.SUBDIVIDES;
+
+        // Convert barycentric to 2D grid coordinates
+        const u = bary.y; // Distance along edge from v1 to v2
+        const v = bary.z; // Distance along edge from v1 to v3
+
+        // Scale to subdivision grid
+        const gridU = u * n;
+        const gridV = v * n;
+
+        // Get grid coordinates
+        const gridX = Math.floor(gridU);
+        const gridY = Math.floor(gridV);
+
+        // Local coordinates within grid cell
+        const localU = gridU - gridX;
+        const localV = gridV - gridY;
+
+        // Make sure we're within the triangle bounds
+        if (gridX + gridY >= n) {
+            return (this.SUBDIVIDES * this.SUBDIVIDES) - 1;
+        }
+
+        // Calculate row and position within row
+        const row = gridY;
+        const col = gridX;
+
+        // Calculate triangles before this row
+        let trianglesBeforeRow = row * (2 * n - row);
+
+        // In this grid cell, determine if we're in upper or lower triangle
+        const triangleInCell = (localU + localV > 1.0) ? 1 : 0;
+
+        // Position in current row
+        const posInRow = col * 2 + triangleInCell;
+
+        // Total index
+        const index = trianglesBeforeRow + posInRow;
+
+        return Math.min(Math.max(0, Math.floor(index)), (this.SUBDIVIDES * this.SUBDIVIDES) - 1);
     }
 
     private onWindowResize() {
